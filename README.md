@@ -11,7 +11,7 @@ docker run -d -p 9886:8000 \
   -e ROCKETCHAT_URL=https://chat.example.com \
   -e ROCKETCHAT_AUTH_TOKEN=your-token \
   -e ROCKETCHAT_USER_ID=your-user-id \
-  ghcr.io/enyonee/rocketchat-mcp:v1.0.0
+  ghcr.io/enyonee/rocketchat-mcp:latest
 ```
 
 Get token and User ID: Rocket.Chat → Profile → Personal Access Tokens.
