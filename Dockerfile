@@ -1,16 +1,12 @@
-FROM python:3.11-slim
-
+FROM golang:1.23-alpine AS builder
 WORKDIR /app
+COPY go.mod main.go ./
+RUN go get github.com/mark3labs/mcp-go@latest && \
+    go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /rocketchat-mcp .
 
-COPY pyproject.toml uv.lock ./
-RUN pip install --no-cache-dir uv && uv sync --frozen --no-dev
-
-COPY server.py .
-
-ENV MCP_TRANSPORT=streamable-http
-ENV MCP_HOST=0.0.0.0
+FROM gcr.io/distroless/static-debian12
+COPY --from=builder /rocketchat-mcp /rocketchat-mcp
 ENV MCP_PORT=8000
-
 EXPOSE 8000
-
-CMD ["uv", "run", "python", "server.py"]
+ENTRYPOINT ["/rocketchat-mcp"]

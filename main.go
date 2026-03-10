@@ -24,6 +24,7 @@ var (
 	apiBase    string
 	authToken  string
 	authUserID string
+	readOnly   bool
 	httpClient = &http.Client{Timeout: 30 * time.Second}
 )
 
@@ -45,6 +46,7 @@ func main() {
 	apiBase = strings.TrimRight(os.Getenv("ROCKETCHAT_URL"), "/") + "/api/v1"
 	authToken = os.Getenv("ROCKETCHAT_AUTH_TOKEN")
 	authUserID = os.Getenv("ROCKETCHAT_USER_ID")
+	readOnly = strings.EqualFold(os.Getenv("READ_ONLY"), "true")
 
 	port := envOr("MCP_PORT", "8000")
 
@@ -274,6 +276,13 @@ func fail(msg string) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultError(msg), nil
 }
 
+func writeGuard() (*mcp.CallToolResult, bool) {
+	if readOnly {
+		return mcp.NewToolResultError("read-only mode: write operations are disabled"), true
+	}
+	return nil, false
+}
+
 func getSlice(data map[string]any, key string) []any { v, _ := data[key].([]any); return v }
 
 func fmtAll(items []any, fn func(map[string]any) map[string]any) []map[string]any {
@@ -412,6 +421,9 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Канал")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Текст сообщения")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
 		ch := sarg(req, "channel")
 		data, err := rcPost("/chat.postMessage", map[string]string{"channel": ch, "text": sarg(req, "text")})
 		if err != nil {
@@ -426,6 +438,9 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithString("username", mcp.Required(), mcp.Description("Username получателя")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Текст сообщения")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
 		username := sarg(req, "username")
 		dm, err := rcPost("/im.create", map[string]string{"username": username})
 		if err != nil {
@@ -471,6 +486,9 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithString("text", mcp.Required(), mcp.Description("Текст ответа")),
 		mcp.WithString("channel", mcp.Description("Room ID (опционально)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
 		tid := sarg(req, "thread_id")
 		ch := sarg(req, "channel")
 		if ch == "" {
@@ -500,6 +518,9 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("ID сообщения")),
 		mcp.WithString("emoji", mcp.Required(), mcp.Description("Эмодзи")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
 		msgID := sarg(req, "message_id")
 		emoji := sarg(req, "emoji")
 		_, err := rcPost("/chat.react", map[string]string{"messageId": msgID, "emoji": emoji})

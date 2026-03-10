@@ -16,6 +16,8 @@ docker run -d -p 9886:8000 \
 
 Get token and User ID: Rocket.Chat → Profile → Personal Access Tokens.
 
+Set `READ_ONLY=true` to disable write operations (send_message, send_dm, reply_to_thread, add_reaction).
+
 ## Connect to Claude Code
 
 ```json
