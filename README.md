@@ -11,6 +11,7 @@ docker run -d -p 9886:8000 \
   -e ROCKETCHAT_URL=https://chat.example.com \
   -e ROCKETCHAT_AUTH_TOKEN=your-token \
   -e ROCKETCHAT_USER_ID=your-user-id \
+  -e READ_ONLY=true \
   ghcr.io/enyonee/rocketchat-mcp:latest
 ```
 
