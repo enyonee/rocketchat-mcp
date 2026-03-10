@@ -7,13 +7,11 @@ MCP server for Rocket.Chat.
 ## Quick start
 
 ```bash
-docker build -t rocketchat-mcp .
-
 docker run -d -p 9886:8000 \
   -e ROCKETCHAT_URL=https://chat.example.com \
   -e ROCKETCHAT_AUTH_TOKEN=your-token \
   -e ROCKETCHAT_USER_ID=your-user-id \
-  rocketchat-mcp
+  ghcr.io/enyonee/rocketchat-mcp:v1.0.0
 ```
 
 Get token and User ID: Rocket.Chat → Profile → Personal Access Tokens.
