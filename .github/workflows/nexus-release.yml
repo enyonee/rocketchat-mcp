@@ -1,0 +1,20 @@
+name: Release to Nexus
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag override (e.g. test-1)"
+        required: false
+        default: ""
+
+jobs:
+  push-nexus:
+    uses: enyonee/.github/.github/workflows/nexus-push.yml@main
+    with:
+      image_name: rocketchat-mcp
+      platforms: linux/amd64,linux/arm64
+      tag: ${{ inputs.tag || '' }}
+    secrets: inherit
