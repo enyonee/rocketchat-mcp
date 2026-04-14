@@ -3,15 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
+	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -21,6 +28,7 @@ import (
 const defaultCount = 50
 
 var (
+	baseURL    string
 	apiBase    string
 	authToken  string
 	authUserID string
@@ -43,7 +51,8 @@ func main() {
 			log.Fatalf("%s is required", v)
 		}
 	}
-	apiBase = strings.TrimRight(os.Getenv("ROCKETCHAT_URL"), "/") + "/api/v1"
+	baseURL = strings.TrimRight(os.Getenv("ROCKETCHAT_URL"), "/")
+	apiBase = baseURL + "/api/v1"
 	authToken = os.Getenv("ROCKETCHAT_AUTH_TOKEN")
 	authUserID = os.Getenv("ROCKETCHAT_USER_ID")
 	readOnly = strings.EqualFold(os.Getenv("READ_ONLY"), "true")
@@ -64,8 +73,20 @@ func main() {
 	mux.Handle("/mcp", streamable)
 	mux.Handle("/", sseServer)
 
+	srv := &http.Server{Addr: ":" + port, Handler: mux}
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		log.Println("shutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
 	log.Printf("rocketchat-mcp listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 func envOr(key, def string) string {
@@ -130,11 +151,101 @@ func rcPost(endpoint string, body any) (map[string]any, error) {
 	return rcRequest("POST", endpoint, body)
 }
 
+const maxDownloadSize = 25 * 1024 * 1024 // 25 MB
+
+func rcDownload(fileURL string) ([]byte, string, error) {
+	if strings.HasPrefix(fileURL, "/") {
+		fileURL = baseURL + fileURL
+	}
+	// Validate URL is on the same RC server (prevent SSRF)
+	parsed, err := url.Parse(fileURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid URL: %v", err)
+	}
+	baseParsed, _ := url.Parse(baseURL)
+	if parsed.Host != baseParsed.Host {
+		return nil, "", fmt.Errorf("URL host %q does not match server %q", parsed.Host, baseParsed.Host)
+	}
+	req, err := http.NewRequest("GET", fileURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("X-Auth-Token", authToken)
+	req.Header.Set("X-User-Id", authUserID)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("HTTP %d downloading file", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if i := strings.Index(ct, ";"); i > 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadSize+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > maxDownloadSize {
+		return nil, "", fmt.Errorf("file exceeds 25 MB limit")
+	}
+	return data, ct, nil
+}
+
+func rcUpload(roomID, filename, mimeType string, fileData []byte, msg string) (map[string]any, error) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	h := make(textproto.MIMEHeader)
+	// Escape filename to prevent header injection
+	escaped := strings.NewReplacer(`"`, `\"`, `\`, `\\`).Replace(filename)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, escaped))
+	if mimeType != "" {
+		h.Set("Content-Type", mimeType)
+	}
+	part, err := writer.CreatePart(h)
+	if err != nil {
+		return nil, err
+	}
+	part.Write(fileData)
+	if msg != "" {
+		writer.WriteField("description", msg)
+	}
+	writer.Close()
+
+	req, err := http.NewRequest("POST", apiBase+"/rooms.upload/"+roomID, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Auth-Token", authToken)
+	req.Header.Set("X-User-Id", authUserID)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	var result map[string]any
+	json.Unmarshal(raw, &result)
+	return result, nil
+}
+
+var roomCache sync.Map // name -> roomID
+
 func resolveRoomID(channel string) (string, error) {
-	if len(channel) > 15 && !strings.Contains(channel, " ") && !strings.Contains(channel, "#") {
+	// Mongo ObjectID: 17+ alphanumeric chars, no spaces/punctuation
+	if len(channel) >= 17 && !strings.ContainsAny(channel, " #-_@.") {
 		return channel, nil
 	}
 	name := strings.TrimLeft(channel, "#")
+	if cached, ok := roomCache.Load(name); ok {
+		return cached.(string), nil
+	}
 	for _, ep := range []struct{ path, key string }{
 		{"/channels.info", "channel"},
 		{"/groups.info", "group"},
@@ -145,11 +256,12 @@ func resolveRoomID(channel string) (string, error) {
 		}
 		if obj, ok := data[ep.key].(map[string]any); ok {
 			if id, ok := obj["_id"].(string); ok {
+				roomCache.Store(name, id)
 				return id, nil
 			}
 		}
 	}
-	return "", fmt.Errorf("канал/группа '%s' не найден(а)", channel)
+	return "", fmt.Errorf("channel/group '%s' not found", channel)
 }
 
 // ── Форматирование ───────────────────────────────
@@ -182,18 +294,85 @@ func fmtMsg(m map[string]any) map[string]any {
 		var out []map[string]string
 		for _, a := range atts {
 			if att, ok := a.(map[string]any); ok {
-				out = append(out, map[string]string{
-					"title": str(att, "title"), "type": str(att, "type"),
-					"url": str(att, "title_link"),
-				})
+				link := str(att, "title_link")
+				if link == "" {
+					link = str(att, "image_url")
+				}
+				entry := map[string]string{}
+				if v := str(att, "title"); v != "" {
+					entry["title"] = v
+				}
+				if v := str(att, "type"); v != "" {
+					entry["type"] = v
+				}
+				if v := absURL(link); v != "" {
+					entry["url"] = v
+				}
+				if v := absURL(str(att, "image_url")); v != "" {
+					entry["image_url"] = v
+				}
+				if v := str(att, "description"); v != "" {
+					entry["description"] = v
+				}
+				if len(entry) > 0 {
+					out = append(out, entry)
+				}
 			}
 		}
-		result["attachments"] = out
+		if len(out) > 0 {
+			result["attachments"] = out
+		}
 	}
 	if f, ok := m["file"].(map[string]any); ok {
-		result["file"] = map[string]string{"name": str(f, "name"), "type": str(f, "type")}
+		fileURL := ""
+		// Build download URL from file ID and name
+		if fid, _ := f["_id"].(string); fid != "" {
+			fileURL = baseURL + "/file-upload/" + fid + "/" + url.PathEscape(str(f, "name"))
+		}
+		result["file"] = map[string]any{
+			"name": str(f, "name"),
+			"type": str(f, "type"),
+			"size": f["size"],
+			"url":  fileURL,
+		}
 	}
 	return result
+}
+
+// fmtMsgCompact strips a formatted (or grouped) message down to id/user/text/ts only.
+func fmtMsgCompact(m map[string]any) map[string]any {
+	out := map[string]any{}
+	// Grouped messages use "ids" and "texts"
+	if ids, ok := m["ids"]; ok {
+		out["ids"] = ids
+		out["user"] = m["user"]
+		out["ts"] = m["ts"]
+		if texts, ok := m["texts"].([]string); ok {
+			for i, t := range texts {
+				texts[i] = truncate(t, 200)
+			}
+			out["texts"] = texts
+		}
+		return out
+	}
+	// Single message
+	out["id"] = m["id"]
+	out["user"] = m["user"]
+	out["ts"] = m["ts"]
+	if text, _ := m["text"].(string); text != "" {
+		out["text"] = truncate(text, 200)
+	} else {
+		out["text"] = ""
+	}
+	return out
+}
+
+func applyCompact(msgs []map[string]any) []map[string]any {
+	out := make([]map[string]any, len(msgs))
+	for i, m := range msgs {
+		out[i] = fmtMsgCompact(m)
+	}
+	return out
 }
 
 func fmtChannel(ch map[string]any) map[string]any {
@@ -234,10 +413,226 @@ func fmtFile(f map[string]any) map[string]any {
 	}
 }
 
+func fmtDM(dm map[string]any) map[string]any {
+	lastMsg := ""
+	if last, ok := dm["lastMessage"].(map[string]any); ok {
+		lastMsg = truncate(str(last, "msg"), 100)
+	}
+	var usernames []string
+	if uns, ok := dm["usernames"].([]any); ok {
+		for _, u := range uns {
+			if s, ok := u.(string); ok {
+				usernames = append(usernames, s)
+			}
+		}
+	}
+	return map[string]any{
+		"id":           dm["_id"],
+		"usernames":    usernames,
+		"last_message": lastMsg,
+		"msgs":         num(dm, "msgs"),
+		"updated_at":   dm["_updatedAt"],
+	}
+}
+
 // ── Хелперы ──────────────────────────────────────
 
 func str(m map[string]any, key string) string { v, _ := m[key].(string); return v }
 func num(m map[string]any, key string) int    { v, _ := m[key].(float64); return int(v) }
+
+func absURL(u string) string {
+	if u == "" {
+		return ""
+	}
+	if strings.HasPrefix(u, "/") {
+		return baseURL + u
+	}
+	return u
+}
+
+// groupMessages merges consecutive messages from the same user within windowSec seconds.
+// Combines text (with newlines) and collects all attachments/files.
+func groupMessages(msgs []map[string]any) []map[string]any {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	const windowSec = 60
+	parseTS := func(v any) time.Time {
+		switch t := v.(type) {
+		case string:
+			ts, _ := time.Parse(time.RFC3339Nano, t)
+			return ts
+		}
+		return time.Time{}
+	}
+	var grouped []map[string]any
+	var cur map[string]any // nil or grouped-format message
+	for _, m := range msgs {
+		if cur == nil {
+			cur = m // not yet grouped, single message
+			continue
+		}
+		curUser := str(cur, "user")
+		t1, t2 := parseTS(cur["ts"]), parseTS(m["ts"])
+		sameUser := curUser == str(m, "user")
+		withinWindow := !t1.IsZero() && !t2.IsZero() && abs64(t1.Sub(t2).Seconds()) < windowSec
+		if sameUser && withinWindow {
+			// Need to group - convert cur to grouped format if not already
+			if _, isGrouped := cur["ids"]; !isGrouped {
+				cur = toGrouped(cur)
+			}
+			mergeInto(cur, m)
+		} else {
+			grouped = append(grouped, cur)
+			cur = m
+		}
+	}
+	if cur != nil {
+		grouped = append(grouped, cur)
+	}
+	return grouped
+}
+
+func abs64(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
+}
+
+// toGrouped converts a single message into grouped format with arrays.
+func toGrouped(m map[string]any) map[string]any {
+	g := map[string]any{
+		"ids":     []string{fmt.Sprint(m["id"])},
+		"user":    m["user"],
+		"ts":      m["ts"],
+		"grouped": true,
+	}
+	if text, _ := m["text"].(string); text != "" {
+		g["texts"] = []string{text}
+	} else {
+		g["texts"] = []string{}
+	}
+	if atts := m["attachments"]; atts != nil {
+		g["attachments"] = atts
+	}
+	if f := m["file"]; f != nil {
+		g["files"] = []any{f}
+	} else {
+		g["files"] = []any{}
+	}
+	if v := m["thread_id"]; v != nil {
+		g["thread_id"] = v
+	}
+	if v := m["thread_replies"]; v != nil {
+		g["thread_replies"] = v
+	}
+	if v := m["reactions"]; v != nil {
+		g["reactions"] = v
+	}
+	return g
+}
+
+func mergeInto(dst, src map[string]any) {
+	// IDs
+	ids, _ := dst["ids"].([]string)
+	ids = append(ids, fmt.Sprint(src["id"]))
+	dst["ids"] = ids
+
+	// Texts
+	texts, _ := dst["texts"].([]string)
+	if srcText, _ := src["text"].(string); srcText != "" {
+		texts = append(texts, srcText)
+	}
+	dst["texts"] = texts
+
+	// Attachments
+	if srcAtt := src["attachments"]; srcAtt != nil {
+		dstAtt, _ := dst["attachments"].([]map[string]string)
+		srcSlice, _ := srcAtt.([]map[string]string)
+		dst["attachments"] = append(dstAtt, srcSlice...)
+	}
+
+	// Files
+	if srcFile := src["file"]; srcFile != nil {
+		files, _ := dst["files"].([]any)
+		dst["files"] = append(files, srcFile)
+	}
+
+	// Thread info: keep first non-nil
+	if src["thread_id"] != nil && dst["thread_id"] == nil {
+		dst["thread_id"] = src["thread_id"]
+	}
+	if src["thread_replies"] != nil && dst["thread_replies"] == nil {
+		dst["thread_replies"] = src["thread_replies"]
+	}
+
+	// Reactions: merge
+	if srcR, ok := src["reactions"].(map[string]any); ok {
+		dstR, _ := dst["reactions"].(map[string]any)
+		if dstR == nil {
+			dstR = map[string]any{}
+		}
+		for k, v := range srcR {
+			dstR[k] = v
+		}
+		dst["reactions"] = dstR
+	}
+}
+
+// expandThreads fetches thread replies for messages that have threads (parallel).
+func expandThreads(msgs []map[string]any, roomID string) {
+	type threadResult struct {
+		idx     int
+		replies []map[string]any
+	}
+	var indices []int
+	for i, m := range msgs {
+		tc, _ := m["thread_replies"].(int)
+		if tc > 0 {
+			indices = append(indices, i)
+		}
+	}
+	if len(indices) == 0 {
+		return
+	}
+	ch := make(chan threadResult, len(indices))
+	for _, i := range indices {
+		go func(idx int) {
+			m := msgs[idx]
+			var msgID string
+			if ids, ok := m["ids"].([]string); ok && len(ids) > 0 {
+				msgID = ids[0]
+			} else if id, ok := m["id"].(string); ok {
+				msgID = id
+			}
+			if msgID == "" {
+				ch <- threadResult{idx, nil}
+				return
+			}
+			data, err := rcGet("/chat.getThreadMessages", url.Values{"tmid": {msgID}, "count": {"50"}})
+			if err != nil {
+				ch <- threadResult{idx, nil}
+				return
+			}
+			ch <- threadResult{idx, fmtAll(getSlice(data, "messages"), fmtMsg)}
+		}(i)
+	}
+	for range indices {
+		r := <-ch
+		if r.replies != nil {
+			msgs[r.idx]["thread"] = r.replies
+		}
+	}
+}
+
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
+}
 
 func getArgs(r mcp.CallToolRequest) map[string]any {
 	m, _ := r.Params.Arguments.(map[string]any)
@@ -248,6 +643,7 @@ func getArgs(r mcp.CallToolRequest) map[string]any {
 }
 
 func sarg(r mcp.CallToolRequest, k string) string { v, _ := getArgs(r)[k].(string); return v }
+func barg(r mcp.CallToolRequest, k string) bool  { v, _ := getArgs(r)[k].(bool); return v }
 
 func iarg(r mcp.CallToolRequest, k string, def int) int {
 	v, ok := getArgs(r)[k].(float64)
@@ -321,13 +717,13 @@ func respMsg(data map[string]any) map[string]any {
 
 func registerTools(s *server.MCPServer) {
 
-	// ── Каналы ──
+	// ── Channels ──
 
 	s.AddTool(mcp.NewTool("list_channels",
-		mcp.WithDescription("Список публичных каналов. query - фильтр по имени."),
-		mcp.WithNumber("count", mcp.Description("Количество (default 100)")),
-		mcp.WithNumber("offset", mcp.Description("Смещение")),
-		mcp.WithString("query", mcp.Description("Фильтр по имени")),
+		mcp.WithDescription("List public channels. Use query to filter by name. Returns id, name, type, member count, message count, topic, and last message preview."),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 100)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
+		mcp.WithString("query", mcp.Description("Filter channels by name substring")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var extra url.Values
 		if q := sarg(req, "query"); q != "" {
@@ -337,16 +733,16 @@ func registerTools(s *server.MCPServer) {
 	})
 
 	s.AddTool(mcp.NewTool("list_joined_channels",
-		mcp.WithDescription("Каналы текущего пользователя."),
-		mcp.WithNumber("count", mcp.Description("Количество (default 100)")),
-		mcp.WithNumber("offset", mcp.Description("Смещение")),
+		mcp.WithDescription("List channels the authenticated user has joined. Returns the same format as list_channels."),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 100)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return listEndpoint(req, "/channels.list.joined", "channels", 100, fmtChannel, nil)
 	})
 
 	s.AddTool(mcp.NewTool("get_channel_info",
-		mcp.WithDescription("Информация о канале по имени или ID."),
-		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
+		mcp.WithDescription("Get detailed information about a channel by name or ID. Returns id, name, type, member count, message count, topic, and last message preview."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		ch := sarg(req, "channel")
 		data, err := rcGet("/channels.info", url.Values{"roomName": {ch}})
@@ -363,20 +759,44 @@ func registerTools(s *server.MCPServer) {
 	})
 
 	s.AddTool(mcp.NewTool("list_groups",
-		mcp.WithDescription("Приватные группы текущего пользователя."),
-		mcp.WithNumber("count", mcp.Description("Количество (default 100)")),
-		mcp.WithNumber("offset", mcp.Description("Смещение")),
+		mcp.WithDescription("List private groups the authenticated user belongs to. Returns the same format as list_channels."),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 100)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return listEndpoint(req, "/groups.listAll", "groups", 100, fmtChannel, nil)
 	})
 
-	// ── Сообщения ──
+	s.AddTool(mcp.NewTool("get_channel_members",
+		mcp.WithDescription("List members of a channel or group. Returns id, username, name, status, and roles for each member."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 100)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		p := paging(req, 100)
+		p.Set("roomId", roomID)
+		data, err := rcGet("/channels.members", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		members := fmtAll(getSlice(data, "members"), fmtUser)
+		return res(map[string]any{"channel": ch, "room_id": roomID, "total": num(data, "total"), "members": members})
+	})
+
+	// ── Messages ──
 
 	s.AddTool(mcp.NewTool("get_channel_messages",
-		mcp.WithDescription("Сообщения из канала/группы (от новых к старым)."),
-		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
-		mcp.WithNumber("count", mcp.Description("Количество (default 50)")),
-		mcp.WithNumber("offset", mcp.Description("Смещение")),
+		mcp.WithDescription("Get messages from a channel (newest first). group=true (default) merges consecutive messages from the same user within 60s. expand_threads=true inlines thread replies. compact=true returns only id/user/text/ts."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithNumber("count", mcp.Description("Number of messages (default 50)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
+		mcp.WithBoolean("group", mcp.Description("Group consecutive messages from same user within 60s (default true)")),
+		mcp.WithBoolean("expand_threads", mcp.Description("Inline thread replies into each message (default false)")),
+		mcp.WithBoolean("compact", mcp.Description("Return only id, user, text (truncated to 200 chars), ts (default false)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		ch := sarg(req, "channel")
 		roomID, err := resolveRoomID(ch)
@@ -390,14 +810,27 @@ func registerTools(s *server.MCPServer) {
 			return fail(err.Error())
 		}
 		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
+		// Group by default unless explicitly false
+		args := getArgs(req)
+		if _, explicit := args["group"]; !explicit || barg(req, "group") {
+			msgs = groupMessages(msgs)
+		}
+		// Expand threads
+		if barg(req, "expand_threads") {
+			expandThreads(msgs, roomID)
+		}
+		if barg(req, "compact") {
+			msgs = applyCompact(msgs)
+		}
 		return res(map[string]any{"channel": ch, "room_id": roomID, "count": len(msgs), "messages": msgs})
 	})
 
 	s.AddTool(mcp.NewTool("search_messages",
-		mcp.WithDescription("Поиск сообщений в канале по тексту."),
-		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
-		mcp.WithString("search_text", mcp.Required(), mcp.Description("Текст для поиска")),
-		mcp.WithNumber("count", mcp.Description("Количество (default 50)")),
+		mcp.WithDescription("Search messages in a channel by text. Returns matching messages with full context. compact=true returns only id/user/text/ts."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithString("search_text", mcp.Required(), mcp.Description("Text to search for")),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 50)")),
+		mcp.WithBoolean("compact", mcp.Description("Return only id, user, text (truncated to 200 chars), ts (default false)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		ch := sarg(req, "channel")
 		search := sarg(req, "search_text")
@@ -413,13 +846,16 @@ func registerTools(s *server.MCPServer) {
 			return fail(err.Error())
 		}
 		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
-		return res(map[string]any{"channel": ch, "search_text": search, "count": len(msgs), "messages": msgs})
+		if barg(req, "compact") {
+			msgs = applyCompact(msgs)
+		}
+		return res(map[string]any{"channel": ch, "room_id": roomID, "search_text": search, "count": len(msgs), "messages": msgs})
 	})
 
 	s.AddTool(mcp.NewTool("send_message",
-		mcp.WithDescription("Отправить сообщение в канал/группу (по имени без # или room ID)."),
-		mcp.WithString("channel", mcp.Required(), mcp.Description("Канал")),
-		mcp.WithString("text", mcp.Required(), mcp.Description("Текст сообщения")),
+		mcp.WithDescription("Send a message to a channel or group (by name without # or room ID). Blocked in read-only mode."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or room ID")),
+		mcp.WithString("text", mcp.Required(), mcp.Description("Message text (supports Markdown)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if r, blocked := writeGuard(); blocked {
 			return r, nil
@@ -434,9 +870,9 @@ func registerTools(s *server.MCPServer) {
 	})
 
 	s.AddTool(mcp.NewTool("send_dm",
-		mcp.WithDescription("Личное сообщение пользователю (username без @)."),
-		mcp.WithString("username", mcp.Required(), mcp.Description("Username получателя")),
-		mcp.WithString("text", mcp.Required(), mcp.Description("Текст сообщения")),
+		mcp.WithDescription("Send a direct message to a user (username without @). Creates the DM conversation if it does not exist. Blocked in read-only mode."),
+		mcp.WithString("username", mcp.Required(), mcp.Description("Recipient username (without @)")),
+		mcp.WithString("text", mcp.Required(), mcp.Description("Message text")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if r, blocked := writeGuard(); blocked {
 			return r, nil
@@ -448,11 +884,11 @@ func registerTools(s *server.MCPServer) {
 		}
 		room, _ := dm["room"].(map[string]any)
 		if room == nil {
-			return fail(fmt.Sprintf("не удалось создать DM с %s", username))
+			return fail(fmt.Sprintf("failed to create DM with %s", username))
 		}
 		roomID, _ := room["_id"].(string)
 		if roomID == "" {
-			return fail(fmt.Sprintf("не удалось создать DM с %s", username))
+			return fail(fmt.Sprintf("failed to create DM with %s", username))
 		}
 		data, err := rcPost("/chat.sendMessage", map[string]any{"message": map[string]string{"rid": roomID, "msg": sarg(req, "text")}})
 		if err != nil {
@@ -462,12 +898,13 @@ func registerTools(s *server.MCPServer) {
 		return res(map[string]any{"status": "sent", "id": msg["_id"], "to": username, "room_id": roomID, "ts": msg["ts"]})
 	})
 
-	// ── Треды ──
+	// ── Threads ──
 
 	s.AddTool(mcp.NewTool("get_thread_messages",
-		mcp.WithDescription("Сообщения из треда (thread_id = ID родительского сообщения)."),
-		mcp.WithString("thread_id", mcp.Required(), mcp.Description("ID родительского сообщения")),
-		mcp.WithNumber("count", mcp.Description("Количество (default 50)")),
+		mcp.WithDescription("Get messages from a thread by its parent message ID. Returns all replies in the thread. compact=true returns only id/user/text/ts."),
+		mcp.WithString("thread_id", mcp.Required(), mcp.Description("Parent message ID that started the thread")),
+		mcp.WithNumber("count", mcp.Description("Number of messages (default 50)")),
+		mcp.WithBoolean("compact", mcp.Description("Return only id, user, text (truncated to 200 chars), ts (default false)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		tid := sarg(req, "thread_id")
 		p := paging(req, defaultCount)
@@ -477,14 +914,17 @@ func registerTools(s *server.MCPServer) {
 			return fail(err.Error())
 		}
 		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
+		if barg(req, "compact") {
+			msgs = applyCompact(msgs)
+		}
 		return res(map[string]any{"thread_id": tid, "count": len(msgs), "messages": msgs})
 	})
 
 	s.AddTool(mcp.NewTool("reply_to_thread",
-		mcp.WithDescription("Ответить в тред. channel - room ID (если не указан, определится автоматически)."),
-		mcp.WithString("thread_id", mcp.Required(), mcp.Description("ID родительского сообщения")),
-		mcp.WithString("text", mcp.Required(), mcp.Description("Текст ответа")),
-		mcp.WithString("channel", mcp.Description("Room ID (опционально)")),
+		mcp.WithDescription("Reply to a thread. If channel is omitted, it is resolved automatically from the parent message. Blocked in read-only mode."),
+		mcp.WithString("thread_id", mcp.Required(), mcp.Description("Parent message ID")),
+		mcp.WithString("text", mcp.Required(), mcp.Description("Reply text")),
+		mcp.WithString("channel", mcp.Description("Room ID (optional, auto-resolved if omitted)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if r, blocked := writeGuard(); blocked {
 			return r, nil
@@ -501,7 +941,7 @@ func registerTools(s *server.MCPServer) {
 			}
 		}
 		if ch == "" {
-			return fail("не удалось определить канал треда")
+			return fail("could not determine thread channel")
 		}
 		data, err := rcPost("/chat.sendMessage", map[string]any{"message": map[string]string{"rid": ch, "msg": sarg(req, "text"), "tmid": tid}})
 		if err != nil {
@@ -511,12 +951,12 @@ func registerTools(s *server.MCPServer) {
 		return res(map[string]any{"status": "sent", "id": msg["_id"], "thread_id": tid, "ts": msg["ts"]})
 	})
 
-	// ── Реакции ──
+	// ── Reactions ──
 
 	s.AddTool(mcp.NewTool("add_reaction",
-		mcp.WithDescription("Реакция на сообщение (emoji: \":thumbsup:\", \":white_check_mark:\" и т.д.)."),
-		mcp.WithString("message_id", mcp.Required(), mcp.Description("ID сообщения")),
-		mcp.WithString("emoji", mcp.Required(), mcp.Description("Эмодзи")),
+		mcp.WithDescription("Add an emoji reaction to a message. Use standard emoji codes like :thumbsup:, :white_check_mark:, :eyes:. Blocked in read-only mode."),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("Message ID to react to")),
+		mcp.WithString("emoji", mcp.Required(), mcp.Description("Emoji code with colons (e.g. :thumbsup:)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if r, blocked := writeGuard(); blocked {
 			return r, nil
@@ -530,13 +970,13 @@ func registerTools(s *server.MCPServer) {
 		return res(map[string]any{"status": "reacted", "message_id": msgID, "emoji": emoji})
 	})
 
-	// ── Пользователи ──
+	// ── Users ──
 
 	s.AddTool(mcp.NewTool("list_users",
-		mcp.WithDescription("Список пользователей. query - фильтр по имени/username."),
-		mcp.WithNumber("count", mcp.Description("Количество (default 100)")),
-		mcp.WithNumber("offset", mcp.Description("Смещение")),
-		mcp.WithString("query", mcp.Description("Фильтр")),
+		mcp.WithDescription("List users on the server. Use query to filter by name or username. Returns id, username, name, status, and roles."),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 100)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
+		mcp.WithString("query", mcp.Description("Filter by name or username substring")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var extra url.Values
 		if q := sarg(req, "query"); q != "" {
@@ -546,8 +986,8 @@ func registerTools(s *server.MCPServer) {
 	})
 
 	s.AddTool(mcp.NewTool("get_user_info",
-		mcp.WithDescription("Информация о пользователе по username."),
-		mcp.WithString("username", mcp.Required(), mcp.Description("Username")),
+		mcp.WithDescription("Get detailed information about a user by username. Returns id, username, display name, online status, and roles."),
+		mcp.WithString("username", mcp.Required(), mcp.Description("Username to look up")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		data, err := rcGet("/users.info", url.Values{"username": {sarg(req, "username")}})
 		if err != nil {
@@ -559,13 +999,13 @@ func registerTools(s *server.MCPServer) {
 		return res(map[string]any{})
 	})
 
-	// ── Файлы ──
+	// ── Files ──
 
 	s.AddTool(mcp.NewTool("list_room_files",
-		mcp.WithDescription("Файлы в канале/группе."),
-		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
-		mcp.WithNumber("count", mcp.Description("Количество (default 50)")),
-		mcp.WithNumber("offset", mcp.Description("Смещение")),
+		mcp.WithDescription("List files shared in a channel or group. Returns id, name, type, size, uploader, and download URL for each file."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 50)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		ch := sarg(req, "channel")
 		roomID, err := resolveRoomID(ch)
@@ -578,6 +1018,410 @@ func registerTools(s *server.MCPServer) {
 		if err != nil {
 			return fail(err.Error())
 		}
-		return res(map[string]any{"channel": ch, "total": num(data, "total"), "files": fmtAll(getSlice(data, "files"), fmtFile)})
+		return res(map[string]any{"channel": ch, "room_id": roomID, "total": num(data, "total"), "files": fmtAll(getSlice(data, "files"), fmtFile)})
+	})
+
+	s.AddTool(mcp.NewTool("download_file",
+		mcp.WithDescription("Download a file from Rocket.Chat by URL (from list_room_files or message attachments). Images returned as visual content, text as plain text, other files as base64."),
+		mcp.WithString("url", mcp.Required(), mcp.Description("File URL (relative /file-upload/... or absolute)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		fileURL := sarg(req, "url")
+		if fileURL == "" {
+			return fail("url is required")
+		}
+		data, mimeType, err := rcDownload(fileURL)
+		if err != nil {
+			return fail(err.Error())
+		}
+		encoded := base64.StdEncoding.EncodeToString(data)
+		if strings.HasPrefix(mimeType, "image/") {
+			return mcp.NewToolResultImage(fmt.Sprintf("Image (%s, %d bytes)", mimeType, len(data)), encoded, mimeType), nil
+		}
+		if strings.HasPrefix(mimeType, "text/") {
+			return mcp.NewToolResultText(string(data)), nil
+		}
+		return mcp.NewToolResultResource(
+			fmt.Sprintf("File (%s, %d bytes)", mimeType, len(data)),
+			mcp.BlobResourceContents{URI: fileURL, MIMEType: mimeType, Blob: encoded},
+		), nil
+	})
+
+	s.AddTool(mcp.NewTool("send_file",
+		mcp.WithDescription("Upload a file to a channel or group. File content must be base64-encoded. Blocked in read-only mode."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithString("content", mcp.Required(), mcp.Description("Base64-encoded file content")),
+		mcp.WithString("filename", mcp.Required(), mcp.Description("Filename with extension (e.g. report.pdf)")),
+		mcp.WithString("mime_type", mcp.Description("MIME type (auto-detected from extension if empty)")),
+		mcp.WithString("message", mcp.Description("Optional message to accompany the file")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		raw, err := base64.StdEncoding.DecodeString(sarg(req, "content"))
+		if err != nil {
+			return fail("invalid base64: " + err.Error())
+		}
+		filename := sarg(req, "filename")
+		mimeType := sarg(req, "mime_type")
+		data, err := rcUpload(roomID, filename, mimeType, raw, sarg(req, "message"))
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "uploaded", "channel": ch, "room_id": roomID, "message": data["message"]})
+	})
+
+	// ── Message context ──
+
+	s.AddTool(mcp.NewTool("get_message_context",
+		mcp.WithDescription("Get messages surrounding a specific message ID - useful for understanding discussion context. Returns N messages before and after the target. compact=true returns only id/user/text/ts."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("Target message ID")),
+		mcp.WithNumber("before", mcp.Description("Number of messages before target (default 5)")),
+		mcp.WithNumber("after", mcp.Description("Number of messages after target (default 5)")),
+		mcp.WithBoolean("compact", mcp.Description("Return only id, user, text (truncated to 200 chars), ts (default false)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		msgID := sarg(req, "message_id")
+		before := iarg(req, "before", 5)
+		after := iarg(req, "after", 5)
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		// Get target message timestamp
+		msgData, err := rcGet("/chat.getMessage", url.Values{"msgId": {msgID}})
+		if err != nil {
+			return fail(err.Error())
+		}
+		msg, _ := msgData["message"].(map[string]any)
+		if msg == nil {
+			return fail("message not found")
+		}
+		ts, _ := msg["ts"].(string)
+		if ts == "" {
+			return fail("message has no timestamp")
+		}
+		// Fetch before + after in parallel
+		total := before + after + 1
+		fetchAfter := after + 1
+		type histResult struct {
+			msgs []map[string]any
+		}
+		chBefore := make(chan histResult, 1)
+		chAfter := make(chan histResult, 1)
+		go func() {
+			data, _ := rcGet("/channels.history", url.Values{
+				"roomId": {roomID}, "latest": {ts}, "count": {strconv.Itoa(before)},
+			})
+			chBefore <- histResult{fmtAll(getSlice(data, "messages"), fmtMsg)}
+		}()
+		go func() {
+			data, _ := rcGet("/channels.history", url.Values{
+				"roomId": {roomID}, "oldest": {ts}, "count": {strconv.Itoa(fetchAfter + 20)},
+			})
+			chAfter <- histResult{fmtAll(getSlice(data, "messages"), fmtMsg)}
+		}()
+		msgsBefore := (<-chBefore).msgs
+		msgsAfterRaw := (<-chAfter).msgs
+		// msgsAfterRaw is newest-first, we need oldest-first (closest to target)
+		// Reverse to chronological, then take first fetchAfter items
+		for i, j := 0, len(msgsAfterRaw)-1; i < j; i, j = i+1, j-1 {
+			msgsAfterRaw[i], msgsAfterRaw[j] = msgsAfterRaw[j], msgsAfterRaw[i]
+		}
+		msgsAfter := msgsAfterRaw
+		if len(msgsAfter) > fetchAfter {
+			msgsAfter = msgsAfter[:fetchAfter]
+		}
+
+		// Build the target message
+		targetFmt := fmtMsg(msg)
+		targetFmt["is_target"] = true
+
+		// Combine: before (reverse to chronological) + target + after (already chronological)
+		all := make([]map[string]any, 0, total)
+		for i := len(msgsBefore) - 1; i >= 0; i-- {
+			all = append(all, msgsBefore[i])
+		}
+		all = append(all, targetFmt)
+		// Filter out target from after-set (in case API includes it)
+		for _, m := range msgsAfter {
+			if m["id"] != msgID {
+				all = append(all, m)
+			}
+		}
+		if barg(req, "compact") {
+			all = applyCompact(all)
+		}
+		return res(map[string]any{"channel": ch, "room_id": roomID, "target_id": msgID, "count": len(all), "messages": all})
+	})
+
+	s.AddTool(mcp.NewTool("get_pinned_messages",
+		mcp.WithDescription("Get pinned messages in a channel. Returns full message details including attachments and reactions. compact=true returns only id/user/text/ts."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 50)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
+		mcp.WithBoolean("compact", mcp.Description("Return only id, user, text (truncated to 200 chars), ts (default false)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		p := paging(req, defaultCount)
+		p.Set("roomId", roomID)
+		data, err := rcGet("/chat.getPinnedMessages", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
+		if barg(req, "compact") {
+			msgs = applyCompact(msgs)
+		}
+		return res(map[string]any{"channel": ch, "room_id": roomID, "count": len(msgs), "messages": msgs})
+	})
+
+	// ── Unread ──
+
+	s.AddTool(mcp.NewTool("get_unread_channels",
+		mcp.WithDescription("Get channels with unread messages for the authenticated user. Sorted by unread count descending. Returns room_id, name, type, unread count, and mention counts."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Use epoch as updatedSince to get ALL subscriptions
+		data, err := rcGet("/subscriptions.get", url.Values{"updatedSince": {"2000-01-01T00:00:00Z"}})
+		if err != nil {
+			return fail(err.Error())
+		}
+		subs := getSlice(data, "update")
+		var unread []map[string]any
+		for _, s := range subs {
+			sub, ok := s.(map[string]any)
+			if !ok {
+				continue
+			}
+			u := num(sub, "unread")
+			if u == 0 {
+				continue
+			}
+			unread = append(unread, map[string]any{
+				"room_id":        sub["rid"],
+				"name":           str(sub, "name"),
+				"type":           str(sub, "t"),
+				"unread":         u,
+				"user_mentions":  num(sub, "userMentions"),
+				"group_mentions": num(sub, "groupMentions"),
+			})
+		}
+		sort.Slice(unread, func(i, j int) bool {
+			return num(unread[i], "unread") > num(unread[j], "unread")
+		})
+		return res(map[string]any{"total": len(unread), "channels": unread})
+	})
+
+	s.AddTool(mcp.NewTool("mark_as_read",
+		mcp.WithDescription("Mark all messages in a channel as read. Clears the unread counter for the authenticated user."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		_, err = rcPost("/subscriptions.read", map[string]string{"rid": roomID})
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "marked_read", "channel": ch, "room_id": roomID})
+	})
+
+	s.AddTool(mcp.NewTool("get_mentions",
+		mcp.WithDescription("Get messages that mention the authenticated user in a channel. Useful for finding messages that need your attention. compact=true returns only id/user/text/ts."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 50)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
+		mcp.WithBoolean("compact", mcp.Description("Return only id, user, text (truncated to 200 chars), ts (default false)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		p := paging(req, defaultCount)
+		p.Set("roomId", roomID)
+		data, err := rcGet("/chat.getMentionedMessages", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
+		if barg(req, "compact") {
+			msgs = applyCompact(msgs)
+		}
+		return res(map[string]any{"channel": ch, "room_id": roomID, "count": len(msgs), "messages": msgs})
+	})
+
+	// ── DMs ──
+
+	s.AddTool(mcp.NewTool("list_dms",
+		mcp.WithDescription("List direct message conversations for the authenticated user. Returns id, participant usernames, last message preview, message count, and last update time."),
+		mcp.WithNumber("count", mcp.Description("Number of results (default 50)")),
+		mcp.WithNumber("offset", mcp.Description("Pagination offset")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		p := paging(req, defaultCount)
+		data, err := rcGet("/im.list", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		dms := fmtAll(getSlice(data, "ims"), fmtDM)
+		return res(map[string]any{"total": num(data, "total"), "dms": dms})
+	})
+
+	// ── Digest ──
+
+	s.AddTool(mcp.NewTool("get_channel_digest",
+		mcp.WithDescription("Channel activity summary for the last N hours: active users with message counts, threads, shared files. Fetches up to 500 messages and aggregates server-side."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name or ID")),
+		mcp.WithNumber("hours", mcp.Description("Time window in hours (default 24)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		hours := iarg(req, "hours", 24)
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		oldest := time.Now().UTC().Add(-time.Duration(hours) * time.Hour).Format(time.RFC3339)
+		p := url.Values{
+			"roomId": {roomID},
+			"oldest": {oldest},
+			"count":  {"500"},
+		}
+		data, err := rcGet("/channels.history", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		messages := getSlice(data, "messages")
+
+		// Aggregate
+		userCounts := map[string]int{}
+		var threads []map[string]any
+		var files []map[string]any
+		for _, m := range messages {
+			msg, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			if u, ok := msg["u"].(map[string]any); ok {
+				username, _ := u["username"].(string)
+				userCounts[username]++
+			}
+			if tc, ok := msg["tcount"].(float64); ok && tc > 0 {
+				threads = append(threads, map[string]any{
+					"id":      msg["_id"],
+					"text":    truncate(str(msg, "msg"), 120),
+					"replies": int(tc),
+				})
+			}
+			if f, ok := msg["file"].(map[string]any); ok {
+				files = append(files, map[string]any{
+					"name": str(f, "name"),
+					"type": str(f, "type"),
+				})
+			}
+		}
+		// Sort users by message count
+		type userCount struct {
+			User  string `json:"user"`
+			Count int    `json:"count"`
+		}
+		var users []userCount
+		for u, c := range userCounts {
+			users = append(users, userCount{u, c})
+		}
+		sort.Slice(users, func(i, j int) bool { return users[i].Count > users[j].Count })
+
+		return res(map[string]any{
+			"channel":        ch,
+			"room_id":        roomID,
+			"period_hours":   hours,
+			"total_messages": len(messages),
+			"active_users":   users,
+			"threads":        threads,
+			"files_shared":   files,
+		})
+	})
+
+	// ── Message management ──
+
+	s.AddTool(mcp.NewTool("edit_message",
+		mcp.WithDescription("Edit an existing message by ID. Requires room_id and message_id. Blocked in read-only mode."),
+		mcp.WithString("room_id", mcp.Required(), mcp.Description("Room ID where the message is")),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("Message ID to edit")),
+		mcp.WithString("text", mcp.Required(), mcp.Description("New message text")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		data, err := rcPost("/chat.update", map[string]string{
+			"roomId": sarg(req, "room_id"),
+			"msgId":  sarg(req, "message_id"),
+			"text":   sarg(req, "text"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		msg := respMsg(data)
+		return res(map[string]any{"status": "edited", "id": msg["_id"], "ts": msg["ts"]})
+	})
+
+	s.AddTool(mcp.NewTool("delete_message",
+		mcp.WithDescription("Delete a message by ID. Requires room_id and message_id. Blocked in read-only mode."),
+		mcp.WithString("room_id", mcp.Required(), mcp.Description("Room ID where the message is")),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("Message ID to delete")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		_, err := rcPost("/chat.delete", map[string]string{
+			"roomId": sarg(req, "room_id"),
+			"msgId":  sarg(req, "message_id"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "deleted", "id": sarg(req, "message_id")})
+	})
+
+	s.AddTool(mcp.NewTool("pin_message",
+		mcp.WithDescription("Pin a message in its channel. The message will appear in get_pinned_messages. Blocked in read-only mode."),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("Message ID to pin")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		_, err := rcPost("/chat.pinMessage", map[string]string{
+			"messageId": sarg(req, "message_id"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "pinned", "id": sarg(req, "message_id")})
+	})
+
+	s.AddTool(mcp.NewTool("unpin_message",
+		mcp.WithDescription("Unpin a previously pinned message. Blocked in read-only mode."),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("Message ID to unpin")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		_, err := rcPost("/chat.unPinMessage", map[string]string{
+			"messageId": sarg(req, "message_id"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "unpinned", "id": sarg(req, "message_id")})
 	})
 }
