@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -167,6 +170,46 @@ func rcDownload(fileURL string) ([]byte, string, error) {
 	return data, ct, nil
 }
 
+func rcUpload(roomID, filename, mimeType string, fileData []byte, msg string) (map[string]any, error) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, filename))
+	if mimeType != "" {
+		h.Set("Content-Type", mimeType)
+	}
+	part, err := writer.CreatePart(h)
+	if err != nil {
+		return nil, err
+	}
+	part.Write(fileData)
+	if msg != "" {
+		writer.WriteField("description", msg)
+	}
+	writer.Close()
+
+	req, err := http.NewRequest("POST", apiBase+"/rooms.upload/"+roomID, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Auth-Token", authToken)
+	req.Header.Set("X-User-Id", authUserID)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var result map[string]any
+	json.Unmarshal(raw, &result)
+	return result, nil
+}
+
 func resolveRoomID(channel string) (string, error) {
 	if len(channel) > 15 && !strings.Contains(channel, " ") && !strings.Contains(channel, "#") {
 		return channel, nil
@@ -219,16 +262,33 @@ func fmtMsg(m map[string]any) map[string]any {
 		var out []map[string]string
 		for _, a := range atts {
 			if att, ok := a.(map[string]any); ok {
+				link := str(att, "title_link")
+				if link == "" {
+					link = str(att, "image_url")
+				}
 				out = append(out, map[string]string{
-					"title": str(att, "title"), "type": str(att, "type"),
-					"url": str(att, "title_link"),
+					"title":        str(att, "title"),
+					"type":         str(att, "type"),
+					"url":          absURL(link),
+					"image_url":    absURL(str(att, "image_url")),
+					"description":  str(att, "description"),
 				})
 			}
 		}
 		result["attachments"] = out
 	}
 	if f, ok := m["file"].(map[string]any); ok {
-		result["file"] = map[string]string{"name": str(f, "name"), "type": str(f, "type")}
+		fileURL := ""
+		// Build download URL from file ID and name
+		if fid, _ := f["_id"].(string); fid != "" {
+			fileURL = baseURL + "/file-upload/" + fid + "/" + url.PathEscape(str(f, "name"))
+		}
+		result["file"] = map[string]any{
+			"name": str(f, "name"),
+			"type": str(f, "type"),
+			"size": f["size"],
+			"url":  fileURL,
+		}
 	}
 	return result
 }
@@ -276,6 +336,180 @@ func fmtFile(f map[string]any) map[string]any {
 func str(m map[string]any, key string) string { v, _ := m[key].(string); return v }
 func num(m map[string]any, key string) int    { v, _ := m[key].(float64); return int(v) }
 
+func absURL(u string) string {
+	if u == "" {
+		return ""
+	}
+	if strings.HasPrefix(u, "/") {
+		return baseURL + u
+	}
+	return u
+}
+
+// groupMessages merges consecutive messages from the same user within windowSec seconds.
+// Combines text (with newlines) and collects all attachments/files.
+func groupMessages(msgs []map[string]any) []map[string]any {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	const windowSec = 60
+	parseTS := func(v any) time.Time {
+		switch t := v.(type) {
+		case string:
+			ts, _ := time.Parse(time.RFC3339Nano, t)
+			return ts
+		}
+		return time.Time{}
+	}
+	var grouped []map[string]any
+	var cur map[string]any // nil or grouped-format message
+	for _, m := range msgs {
+		if cur == nil {
+			cur = m // not yet grouped, single message
+			continue
+		}
+		curUser := str(cur, "user")
+		t1, t2 := parseTS(cur["ts"]), parseTS(m["ts"])
+		sameUser := curUser == str(m, "user")
+		withinWindow := !t1.IsZero() && !t2.IsZero() && abs64(t1.Sub(t2).Seconds()) < windowSec
+		if sameUser && withinWindow {
+			// Need to group - convert cur to grouped format if not already
+			if _, isGrouped := cur["ids"]; !isGrouped {
+				cur = toGrouped(cur)
+			}
+			mergeInto(cur, m)
+		} else {
+			grouped = append(grouped, cur)
+			cur = m
+		}
+	}
+	if cur != nil {
+		grouped = append(grouped, cur)
+	}
+	return grouped
+}
+
+func abs64(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
+}
+
+// toGrouped converts a single message into grouped format with arrays.
+func toGrouped(m map[string]any) map[string]any {
+	g := map[string]any{
+		"ids":     []string{fmt.Sprint(m["id"])},
+		"user":    m["user"],
+		"ts":      m["ts"],
+		"grouped": true,
+	}
+	if text, _ := m["text"].(string); text != "" {
+		g["texts"] = []string{text}
+	} else {
+		g["texts"] = []string{}
+	}
+	if atts := m["attachments"]; atts != nil {
+		g["attachments"] = atts
+	}
+	if f := m["file"]; f != nil {
+		g["files"] = []any{f}
+	} else {
+		g["files"] = []any{}
+	}
+	if v := m["thread_id"]; v != nil {
+		g["thread_id"] = v
+	}
+	if v := m["thread_replies"]; v != nil {
+		g["thread_replies"] = v
+	}
+	if v := m["reactions"]; v != nil {
+		g["reactions"] = v
+	}
+	return g
+}
+
+func mergeInto(dst, src map[string]any) {
+	// IDs
+	ids, _ := dst["ids"].([]string)
+	ids = append(ids, fmt.Sprint(src["id"]))
+	dst["ids"] = ids
+
+	// Texts
+	texts, _ := dst["texts"].([]string)
+	if srcText, _ := src["text"].(string); srcText != "" {
+		texts = append(texts, srcText)
+	}
+	dst["texts"] = texts
+
+	// Attachments
+	if srcAtt := src["attachments"]; srcAtt != nil {
+		dstAtt, _ := dst["attachments"].([]map[string]string)
+		srcSlice, _ := srcAtt.([]map[string]string)
+		dst["attachments"] = append(dstAtt, srcSlice...)
+	}
+
+	// Files
+	if srcFile := src["file"]; srcFile != nil {
+		files, _ := dst["files"].([]any)
+		dst["files"] = append(files, srcFile)
+	}
+
+	// Thread info: keep first non-nil
+	if src["thread_id"] != nil && dst["thread_id"] == nil {
+		dst["thread_id"] = src["thread_id"]
+	}
+	if src["thread_replies"] != nil && dst["thread_replies"] == nil {
+		dst["thread_replies"] = src["thread_replies"]
+	}
+
+	// Reactions: merge
+	if srcR, ok := src["reactions"].(map[string]any); ok {
+		dstR, _ := dst["reactions"].(map[string]any)
+		if dstR == nil {
+			dstR = map[string]any{}
+		}
+		for k, v := range srcR {
+			dstR[k] = v
+		}
+		dst["reactions"] = dstR
+	}
+}
+
+// expandThreads fetches thread replies for messages that have threads.
+func expandThreads(msgs []map[string]any, roomID string) {
+	for i, m := range msgs {
+		tc, _ := m["thread_replies"].(int)
+		if tc == 0 {
+			continue
+		}
+		// Get message ID - could be single (id string) or grouped (ids []string)
+		var msgID string
+		if ids, ok := m["ids"].([]string); ok && len(ids) > 0 {
+			msgID = ids[0]
+		} else if id, ok := m["id"].(string); ok {
+			msgID = id
+		}
+		if msgID == "" {
+			continue
+		}
+		p := url.Values{"tmid": {msgID}, "count": {"50"}}
+		data, err := rcGet("/chat.getThreadMessages", p)
+		if err != nil {
+			continue
+		}
+		replies := fmtAll(getSlice(data, "messages"), fmtMsg)
+		msgs[i]["thread"] = replies
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
 func getArgs(r mcp.CallToolRequest) map[string]any {
 	m, _ := r.Params.Arguments.(map[string]any)
 	if m == nil {
@@ -285,6 +519,7 @@ func getArgs(r mcp.CallToolRequest) map[string]any {
 }
 
 func sarg(r mcp.CallToolRequest, k string) string { v, _ := getArgs(r)[k].(string); return v }
+func barg(r mcp.CallToolRequest, k string) bool  { v, _ := getArgs(r)[k].(bool); return v }
 
 func iarg(r mcp.CallToolRequest, k string, def int) int {
 	v, ok := getArgs(r)[k].(float64)
@@ -407,13 +642,36 @@ func registerTools(s *server.MCPServer) {
 		return listEndpoint(req, "/groups.listAll", "groups", 100, fmtChannel, nil)
 	})
 
+	s.AddTool(mcp.NewTool("get_channel_members",
+		mcp.WithDescription("Участники канала/группы."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
+		mcp.WithNumber("count", mcp.Description("Количество (default 100)")),
+		mcp.WithNumber("offset", mcp.Description("Смещение")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		p := paging(req, 100)
+		p.Set("roomId", roomID)
+		data, err := rcGet("/channels.members", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		members := fmtAll(getSlice(data, "members"), fmtUser)
+		return res(map[string]any{"channel": ch, "total": num(data, "total"), "members": members})
+	})
+
 	// ── Сообщения ──
 
 	s.AddTool(mcp.NewTool("get_channel_messages",
-		mcp.WithDescription("Сообщения из канала/группы (от новых к старым)."),
+		mcp.WithDescription("Сообщения из канала/группы (от новых к старым). group=true объединяет последовательные сообщения одного юзера (текст+картинка). expand_threads=true подгружает ответы в тредах."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
 		mcp.WithNumber("count", mcp.Description("Количество (default 50)")),
 		mcp.WithNumber("offset", mcp.Description("Смещение")),
+		mcp.WithBoolean("group", mcp.Description("Группировать последовательные сообщения одного юзера (default true)")),
+		mcp.WithBoolean("expand_threads", mcp.Description("Подгрузить ответы в тредах (default false)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		ch := sarg(req, "channel")
 		roomID, err := resolveRoomID(ch)
@@ -427,6 +685,15 @@ func registerTools(s *server.MCPServer) {
 			return fail(err.Error())
 		}
 		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
+		// Group by default unless explicitly false
+		args := getArgs(req)
+		if _, explicit := args["group"]; !explicit || barg(req, "group") {
+			msgs = groupMessages(msgs)
+		}
+		// Expand threads
+		if barg(req, "expand_threads") {
+			expandThreads(msgs, roomID)
+		}
 		return res(map[string]any{"channel": ch, "room_id": roomID, "count": len(msgs), "messages": msgs})
 	})
 
@@ -641,5 +908,337 @@ func registerTools(s *server.MCPServer) {
 			fmt.Sprintf("File (%s, %d bytes)", mimeType, len(data)),
 			mcp.BlobResourceContents{URI: fileURL, MIMEType: mimeType, Blob: encoded},
 		), nil
+	})
+
+	s.AddTool(mcp.NewTool("send_file",
+		mcp.WithDescription("Загрузить файл в канал/группу. Содержимое передаётся в base64."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
+		mcp.WithString("content", mcp.Required(), mcp.Description("Base64-encoded содержимое файла")),
+		mcp.WithString("filename", mcp.Required(), mcp.Description("Имя файла с расширением")),
+		mcp.WithString("mime_type", mcp.Description("MIME тип (auto-detect по расширению если пусто)")),
+		mcp.WithString("message", mcp.Description("Сопроводительное сообщение")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		raw, err := base64.StdEncoding.DecodeString(sarg(req, "content"))
+		if err != nil {
+			return fail("invalid base64: " + err.Error())
+		}
+		filename := sarg(req, "filename")
+		mimeType := sarg(req, "mime_type")
+		data, err := rcUpload(roomID, filename, mimeType, raw, sarg(req, "message"))
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "uploaded", "channel": ch, "message": data["message"]})
+	})
+
+	// ── Контекст сообщений ──
+
+	s.AddTool(mcp.NewTool("get_message_context",
+		mcp.WithDescription("Сообщения вокруг конкретного message_id - контекст дискуссии. Возвращает N сообщений до и после."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("ID сообщения")),
+		mcp.WithNumber("before", mcp.Description("Сообщений до (default 5)")),
+		mcp.WithNumber("after", mcp.Description("Сообщений после (default 5)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		msgID := sarg(req, "message_id")
+		before := iarg(req, "before", 5)
+		after := iarg(req, "after", 5)
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		// Get target message timestamp
+		msgData, err := rcGet("/chat.getMessage", url.Values{"msgId": {msgID}})
+		if err != nil {
+			return fail(err.Error())
+		}
+		msg, _ := msgData["message"].(map[string]any)
+		if msg == nil {
+			return fail("message not found")
+		}
+		ts, _ := msg["ts"].(string)
+		if ts == "" {
+			return fail("message has no timestamp")
+		}
+		// Get a window of messages around the target
+		// RC API returns newest first, so we fetch enough and filter
+		total := before + after + 1
+		pBefore := url.Values{
+			"roomId": {roomID},
+			"latest": {ts},
+			"count":  {strconv.Itoa(before)},
+		}
+		dataBefore, _ := rcGet("/channels.history", pBefore)
+		msgsBefore := fmtAll(getSlice(dataBefore, "messages"), fmtMsg)
+
+		// For "after" - RC returns newest first with oldest=ts, so get more and slice closest
+		fetchAfter := after + 1 // +1 for target itself
+		pAfter := url.Values{
+			"roomId": {roomID},
+			"oldest": {ts},
+			"count":  {strconv.Itoa(fetchAfter + 20)}, // overfetch, then trim
+		}
+		dataAfter, _ := rcGet("/channels.history", pAfter)
+		msgsAfterRaw := fmtAll(getSlice(dataAfter, "messages"), fmtMsg)
+		// msgsAfterRaw is newest-first, we need oldest-first (closest to target)
+		// Reverse to chronological, then take first fetchAfter items
+		for i, j := 0, len(msgsAfterRaw)-1; i < j; i, j = i+1, j-1 {
+			msgsAfterRaw[i], msgsAfterRaw[j] = msgsAfterRaw[j], msgsAfterRaw[i]
+		}
+		msgsAfter := msgsAfterRaw
+		if len(msgsAfter) > fetchAfter {
+			msgsAfter = msgsAfter[:fetchAfter]
+		}
+
+		// Build the target message
+		targetFmt := fmtMsg(msg)
+		targetFmt["is_target"] = true
+
+		// Combine: before (reverse to chronological) + target + after (already chronological)
+		all := make([]map[string]any, 0, total)
+		for i := len(msgsBefore) - 1; i >= 0; i-- {
+			all = append(all, msgsBefore[i])
+		}
+		all = append(all, targetFmt)
+		// Filter out target from after-set (in case API includes it)
+		for _, m := range msgsAfter {
+			if m["id"] != msgID {
+				all = append(all, m)
+			}
+		}
+		return res(map[string]any{"channel": ch, "target_id": msgID, "count": len(all), "messages": all})
+	})
+
+	s.AddTool(mcp.NewTool("get_pinned_messages",
+		mcp.WithDescription("Закреплённые сообщения в канале."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
+		mcp.WithNumber("count", mcp.Description("Количество (default 50)")),
+		mcp.WithNumber("offset", mcp.Description("Смещение")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		p := paging(req, defaultCount)
+		p.Set("roomId", roomID)
+		data, err := rcGet("/chat.getPinnedMessages", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
+		return res(map[string]any{"channel": ch, "count": len(msgs), "messages": msgs})
+	})
+
+	// ── Непрочитанное ──
+
+	s.AddTool(mcp.NewTool("get_unread_channels",
+		mcp.WithDescription("Каналы с непрочитанными сообщениями. Показывает счётчик unread и mentions."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Use epoch as updatedSince to get ALL subscriptions
+		data, err := rcGet("/subscriptions.get", url.Values{"updatedSince": {"2000-01-01T00:00:00Z"}})
+		if err != nil {
+			return fail(err.Error())
+		}
+		subs := getSlice(data, "update")
+		var unread []map[string]any
+		for _, s := range subs {
+			sub, ok := s.(map[string]any)
+			if !ok {
+				continue
+			}
+			u := num(sub, "unread")
+			if u == 0 {
+				continue
+			}
+			unread = append(unread, map[string]any{
+				"room_id":       sub["rid"],
+				"name":          str(sub, "name"),
+				"type":          str(sub, "t"),
+				"unread":        u,
+				"user_mentions": num(sub, "userMentions"),
+				"group_mentions": num(sub, "groupMentions"),
+			})
+		}
+		sort.Slice(unread, func(i, j int) bool {
+			return num(unread[i], "unread") > num(unread[j], "unread")
+		})
+		return res(map[string]any{"total": len(unread), "channels": unread})
+	})
+
+	s.AddTool(mcp.NewTool("get_mentions",
+		mcp.WithDescription("Сообщения с упоминанием текущего пользователя в канале."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
+		mcp.WithNumber("count", mcp.Description("Количество (default 50)")),
+		mcp.WithNumber("offset", mcp.Description("Смещение")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		p := paging(req, defaultCount)
+		p.Set("roomId", roomID)
+		data, err := rcGet("/chat.getMentionedMessages", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		msgs := fmtAll(getSlice(data, "messages"), fmtMsg)
+		return res(map[string]any{"channel": ch, "count": len(msgs), "messages": msgs})
+	})
+
+	// ── Дайджест ──
+
+	s.AddTool(mcp.NewTool("get_channel_digest",
+		mcp.WithDescription("Сводка канала за период: кто писал, сколько сообщений, треды, файлы. Постобработка на сервере."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Имя или ID канала")),
+		mcp.WithNumber("hours", mcp.Description("За сколько часов (default 24)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ch := sarg(req, "channel")
+		hours := iarg(req, "hours", 24)
+		roomID, err := resolveRoomID(ch)
+		if err != nil {
+			return fail(err.Error())
+		}
+		oldest := time.Now().UTC().Add(-time.Duration(hours) * time.Hour).Format(time.RFC3339)
+		p := url.Values{
+			"roomId": {roomID},
+			"oldest": {oldest},
+			"count":  {"500"},
+		}
+		data, err := rcGet("/channels.history", p)
+		if err != nil {
+			return fail(err.Error())
+		}
+		messages := getSlice(data, "messages")
+
+		// Aggregate
+		userCounts := map[string]int{}
+		var threads []map[string]any
+		var files []map[string]any
+		for _, m := range messages {
+			msg, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			if u, ok := msg["u"].(map[string]any); ok {
+				username, _ := u["username"].(string)
+				userCounts[username]++
+			}
+			if tc, ok := msg["tcount"].(float64); ok && tc > 0 {
+				threads = append(threads, map[string]any{
+					"id":      msg["_id"],
+					"text":    truncate(str(msg, "msg"), 120),
+					"replies": int(tc),
+				})
+			}
+			if f, ok := msg["file"].(map[string]any); ok {
+				files = append(files, map[string]any{
+					"name": str(f, "name"),
+					"type": str(f, "type"),
+				})
+			}
+		}
+		// Sort users by message count
+		type userCount struct {
+			User  string `json:"user"`
+			Count int    `json:"count"`
+		}
+		var users []userCount
+		for u, c := range userCounts {
+			users = append(users, userCount{u, c})
+		}
+		sort.Slice(users, func(i, j int) bool { return users[i].Count > users[j].Count })
+
+		return res(map[string]any{
+			"channel":        ch,
+			"period_hours":   hours,
+			"total_messages": len(messages),
+			"active_users":   users,
+			"threads":        threads,
+			"files_shared":   files,
+		})
+	})
+
+	// ── Управление сообщениями ──
+
+	s.AddTool(mcp.NewTool("edit_message",
+		mcp.WithDescription("Редактировать сообщение."),
+		mcp.WithString("room_id", mcp.Required(), mcp.Description("ID комнаты")),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("ID сообщения")),
+		mcp.WithString("text", mcp.Required(), mcp.Description("Новый текст")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		data, err := rcPost("/chat.update", map[string]string{
+			"roomId": sarg(req, "room_id"),
+			"msgId":  sarg(req, "message_id"),
+			"text":   sarg(req, "text"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		msg := respMsg(data)
+		return res(map[string]any{"status": "edited", "id": msg["_id"], "ts": msg["ts"]})
+	})
+
+	s.AddTool(mcp.NewTool("delete_message",
+		mcp.WithDescription("Удалить сообщение."),
+		mcp.WithString("room_id", mcp.Required(), mcp.Description("ID комнаты")),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("ID сообщения")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		_, err := rcPost("/chat.delete", map[string]string{
+			"roomId": sarg(req, "room_id"),
+			"msgId":  sarg(req, "message_id"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "deleted", "id": sarg(req, "message_id")})
+	})
+
+	s.AddTool(mcp.NewTool("pin_message",
+		mcp.WithDescription("Закрепить сообщение в канале."),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("ID сообщения")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		_, err := rcPost("/chat.pinMessage", map[string]string{
+			"messageId": sarg(req, "message_id"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "pinned", "id": sarg(req, "message_id")})
+	})
+
+	s.AddTool(mcp.NewTool("unpin_message",
+		mcp.WithDescription("Открепить сообщение."),
+		mcp.WithString("message_id", mcp.Required(), mcp.Description("ID сообщения")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if r, blocked := writeGuard(); blocked {
+			return r, nil
+		}
+		_, err := rcPost("/chat.unPinMessage", map[string]string{
+			"messageId": sarg(req, "message_id"),
+		})
+		if err != nil {
+			return fail(err.Error())
+		}
+		return res(map[string]any{"status": "unpinned", "id": sarg(req, "message_id")})
 	})
 }
