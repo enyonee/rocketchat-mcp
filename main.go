@@ -15,6 +15,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"strings"
 	"time"
 
@@ -210,11 +211,16 @@ func rcUpload(roomID, filename, mimeType string, fileData []byte, msg string) (m
 	return result, nil
 }
 
+var roomCache sync.Map // name -> roomID
+
 func resolveRoomID(channel string) (string, error) {
 	if len(channel) > 15 && !strings.Contains(channel, " ") && !strings.Contains(channel, "#") {
 		return channel, nil
 	}
 	name := strings.TrimLeft(channel, "#")
+	if cached, ok := roomCache.Load(name); ok {
+		return cached.(string), nil
+	}
 	for _, ep := range []struct{ path, key string }{
 		{"/channels.info", "channel"},
 		{"/groups.info", "group"},
@@ -225,6 +231,7 @@ func resolveRoomID(channel string) (string, error) {
 		}
 		if obj, ok := data[ep.key].(map[string]any); ok {
 			if id, ok := obj["_id"].(string); ok {
+				roomCache.Store(name, id)
 				return id, nil
 			}
 		}
@@ -266,16 +273,30 @@ func fmtMsg(m map[string]any) map[string]any {
 				if link == "" {
 					link = str(att, "image_url")
 				}
-				out = append(out, map[string]string{
-					"title":        str(att, "title"),
-					"type":         str(att, "type"),
-					"url":          absURL(link),
-					"image_url":    absURL(str(att, "image_url")),
-					"description":  str(att, "description"),
-				})
+				entry := map[string]string{}
+				if v := str(att, "title"); v != "" {
+					entry["title"] = v
+				}
+				if v := str(att, "type"); v != "" {
+					entry["type"] = v
+				}
+				if v := absURL(link); v != "" {
+					entry["url"] = v
+				}
+				if v := absURL(str(att, "image_url")); v != "" {
+					entry["image_url"] = v
+				}
+				if v := str(att, "description"); v != "" {
+					entry["description"] = v
+				}
+				if len(entry) > 0 {
+					out = append(out, entry)
+				}
 			}
 		}
-		result["attachments"] = out
+		if len(out) > 0 {
+			result["attachments"] = out
+		}
 	}
 	if f, ok := m["file"].(map[string]any); ok {
 		fileURL := ""
@@ -476,30 +497,49 @@ func mergeInto(dst, src map[string]any) {
 	}
 }
 
-// expandThreads fetches thread replies for messages that have threads.
+// expandThreads fetches thread replies for messages that have threads (parallel).
 func expandThreads(msgs []map[string]any, roomID string) {
+	type threadResult struct {
+		idx     int
+		replies []map[string]any
+	}
+	var indices []int
 	for i, m := range msgs {
 		tc, _ := m["thread_replies"].(int)
-		if tc == 0 {
-			continue
+		if tc > 0 {
+			indices = append(indices, i)
 		}
-		// Get message ID - could be single (id string) or grouped (ids []string)
-		var msgID string
-		if ids, ok := m["ids"].([]string); ok && len(ids) > 0 {
-			msgID = ids[0]
-		} else if id, ok := m["id"].(string); ok {
-			msgID = id
+	}
+	if len(indices) == 0 {
+		return
+	}
+	ch := make(chan threadResult, len(indices))
+	for _, i := range indices {
+		go func(idx int) {
+			m := msgs[idx]
+			var msgID string
+			if ids, ok := m["ids"].([]string); ok && len(ids) > 0 {
+				msgID = ids[0]
+			} else if id, ok := m["id"].(string); ok {
+				msgID = id
+			}
+			if msgID == "" {
+				ch <- threadResult{idx, nil}
+				return
+			}
+			data, err := rcGet("/chat.getThreadMessages", url.Values{"tmid": {msgID}, "count": {"50"}})
+			if err != nil {
+				ch <- threadResult{idx, nil}
+				return
+			}
+			ch <- threadResult{idx, fmtAll(getSlice(data, "messages"), fmtMsg)}
+		}(i)
+	}
+	for range indices {
+		r := <-ch
+		if r.replies != nil {
+			msgs[r.idx]["thread"] = r.replies
 		}
-		if msgID == "" {
-			continue
-		}
-		p := url.Values{"tmid": {msgID}, "count": {"50"}}
-		data, err := rcGet("/chat.getThreadMessages", p)
-		if err != nil {
-			continue
-		}
-		replies := fmtAll(getSlice(data, "messages"), fmtMsg)
-		msgs[i]["thread"] = replies
 	}
 }
 
@@ -969,26 +1009,28 @@ func registerTools(s *server.MCPServer) {
 		if ts == "" {
 			return fail("message has no timestamp")
 		}
-		// Get a window of messages around the target
-		// RC API returns newest first, so we fetch enough and filter
+		// Fetch before + after in parallel
 		total := before + after + 1
-		pBefore := url.Values{
-			"roomId": {roomID},
-			"latest": {ts},
-			"count":  {strconv.Itoa(before)},
+		fetchAfter := after + 1
+		type histResult struct {
+			msgs []map[string]any
 		}
-		dataBefore, _ := rcGet("/channels.history", pBefore)
-		msgsBefore := fmtAll(getSlice(dataBefore, "messages"), fmtMsg)
-
-		// For "after" - RC returns newest first with oldest=ts, so get more and slice closest
-		fetchAfter := after + 1 // +1 for target itself
-		pAfter := url.Values{
-			"roomId": {roomID},
-			"oldest": {ts},
-			"count":  {strconv.Itoa(fetchAfter + 20)}, // overfetch, then trim
-		}
-		dataAfter, _ := rcGet("/channels.history", pAfter)
-		msgsAfterRaw := fmtAll(getSlice(dataAfter, "messages"), fmtMsg)
+		chBefore := make(chan histResult, 1)
+		chAfter := make(chan histResult, 1)
+		go func() {
+			data, _ := rcGet("/channels.history", url.Values{
+				"roomId": {roomID}, "latest": {ts}, "count": {strconv.Itoa(before)},
+			})
+			chBefore <- histResult{fmtAll(getSlice(data, "messages"), fmtMsg)}
+		}()
+		go func() {
+			data, _ := rcGet("/channels.history", url.Values{
+				"roomId": {roomID}, "oldest": {ts}, "count": {strconv.Itoa(fetchAfter + 20)},
+			})
+			chAfter <- histResult{fmtAll(getSlice(data, "messages"), fmtMsg)}
+		}()
+		msgsBefore := (<-chBefore).msgs
+		msgsAfterRaw := (<-chAfter).msgs
 		// msgsAfterRaw is newest-first, we need oldest-first (closest to target)
 		// Reverse to chronological, then take first fetchAfter items
 		for i, j := 0, len(msgsAfterRaw)-1; i < j; i, j = i+1, j-1 {
