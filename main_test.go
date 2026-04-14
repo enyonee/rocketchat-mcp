@@ -646,6 +646,111 @@ func TestAttachmentURLsAbsolute(t *testing.T) {
 	}
 }
 
+// ── Compact mode ──────────────────────────
+
+func TestCompactMode(t *testing.T) {
+	// Send a message to have something to compact
+	ts := time.Now().Format("15:04:05")
+	sent := callTool(t, "send_message", map[string]any{
+		"channel": testRoomID, "text": "[test] compact " + ts,
+	})
+	msgID := requireStr(t, sent, "id")
+
+	r := callTool(t, "get_channel_messages", map[string]any{
+		"channel": testRoomID, "count": 5, "group": false, "compact": true,
+	})
+	msgs := requireSlice(t, r, "messages")
+	if len(msgs) == 0 {
+		t.Fatal("no messages")
+	}
+	m := requireMap(t, msgs[0])
+	// Compact: only id, user, text, ts
+	requireStr(t, m, "id")
+	requireStr(t, m, "user")
+	if _, ok := m["text"].(string); !ok {
+		t.Error("compact message should have string text")
+	}
+	// Should NOT have attachments, reactions, file, thread_replies
+	for _, forbidden := range []string{"attachments", "reactions", "file", "thread_replies"} {
+		if m[forbidden] != nil {
+			t.Errorf("compact should not have %q", forbidden)
+		}
+	}
+
+	// Cleanup
+	callTool(t, "delete_message", map[string]any{"room_id": testRoomID, "message_id": msgID})
+}
+
+func TestCompactSearch(t *testing.T) {
+	r := callTool(t, "search_messages", map[string]any{
+		"channel": testRoomID, "search_text": "test", "count": 3, "compact": true,
+	})
+	msgs := requireSlice(t, r, "messages")
+	for _, raw := range msgs {
+		m := requireMap(t, raw)
+		// Verify compact: no extra fields
+		for _, forbidden := range []string{"attachments", "reactions", "file"} {
+			if m[forbidden] != nil {
+				t.Errorf("compact search should not have %q", forbidden)
+			}
+		}
+	}
+}
+
+// ── mark_as_read ──────────────────────────
+
+func TestMarkAsRead(t *testing.T) {
+	r := callTool(t, "mark_as_read", map[string]any{"channel": testRoomID})
+	if requireStr(t, r, "status") != "marked_read" {
+		t.Error("expected status=marked_read")
+	}
+	requireStr(t, r, "room_id")
+}
+
+// ── DMs ──────────────────────────
+
+func TestListDMs(t *testing.T) {
+	r := callTool(t, "list_dms", map[string]any{"count": 5})
+	if _, ok := r["total"].(float64); !ok {
+		t.Error("total should be number")
+	}
+	dms, ok := r["dms"].([]any)
+	if !ok {
+		t.Fatal("dms should be array")
+	}
+	if len(dms) > 0 {
+		dm := requireMap(t, dms[0])
+		requireStr(t, dm, "id")
+		if _, ok := dm["usernames"].([]any); !ok {
+			t.Error("dm should have usernames array")
+		}
+	}
+}
+
+// ── room_id in responses ──────────────────
+
+func TestRoomIDInResponses(t *testing.T) {
+	// Tools that resolve rooms should return room_id
+	tools := []struct {
+		name string
+		args map[string]any
+	}{
+		{"get_channel_messages", map[string]any{"channel": testRoomID, "count": 1}},
+		{"get_channel_members", map[string]any{"channel": testRoomID, "count": 1}},
+		{"search_messages", map[string]any{"channel": testRoomID, "search_text": "x", "count": 1}},
+		{"list_room_files", map[string]any{"channel": testRoomID, "count": 1}},
+		{"get_pinned_messages", map[string]any{"channel": testRoomID, "count": 1}},
+		{"get_mentions", map[string]any{"channel": testRoomID, "count": 1}},
+		{"mark_as_read", map[string]any{"channel": testRoomID}},
+	}
+	for _, tc := range tools {
+		r := callTool(t, tc.name, tc.args)
+		if rid, _ := r["room_id"].(string); rid == "" {
+			t.Errorf("%s should return room_id", tc.name)
+		}
+	}
+}
+
 // ── Read-only mode ──────────────────────────
 
 func TestReadOnlyBlocksAllWrites(t *testing.T) {
