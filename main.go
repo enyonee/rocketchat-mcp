@@ -157,6 +157,15 @@ func rcDownload(fileURL string) ([]byte, string, error) {
 	if strings.HasPrefix(fileURL, "/") {
 		fileURL = baseURL + fileURL
 	}
+	// Validate URL is on the same RC server (prevent SSRF)
+	parsed, err := url.Parse(fileURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid URL: %v", err)
+	}
+	baseParsed, _ := url.Parse(baseURL)
+	if parsed.Host != baseParsed.Host {
+		return nil, "", fmt.Errorf("URL host %q does not match server %q", parsed.Host, baseParsed.Host)
+	}
 	req, err := http.NewRequest("GET", fileURL, nil)
 	if err != nil {
 		return nil, "", err
@@ -189,7 +198,9 @@ func rcUpload(roomID, filename, mimeType string, fileData []byte, msg string) (m
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	h := make(textproto.MIMEHeader)
-	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, filename))
+	// Escape filename to prevent header injection
+	escaped := strings.NewReplacer(`"`, `\"`, `\`, `\\`).Replace(filename)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, escaped))
 	if mimeType != "" {
 		h.Set("Content-Type", mimeType)
 	}
@@ -215,11 +226,10 @@ func rcUpload(roomID, filename, mimeType string, fileData []byte, msg string) (m
 		return nil, err
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(raw))
 	}
-	raw, _ := io.ReadAll(resp.Body)
 	var result map[string]any
 	json.Unmarshal(raw, &result)
 	return result, nil
@@ -228,7 +238,8 @@ func rcUpload(roomID, filename, mimeType string, fileData []byte, msg string) (m
 var roomCache sync.Map // name -> roomID
 
 func resolveRoomID(channel string) (string, error) {
-	if len(channel) > 15 && !strings.Contains(channel, " ") && !strings.Contains(channel, "#") {
+	// Mongo ObjectID: 17+ alphanumeric chars, no spaces/punctuation
+	if len(channel) >= 17 && !strings.ContainsAny(channel, " #-_@.") {
 		return channel, nil
 	}
 	name := strings.TrimLeft(channel, "#")
@@ -616,10 +627,11 @@ func expandThreads(msgs []map[string]any, roomID string) {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(runes[:n]) + "…"
 }
 
 func getArgs(r mcp.CallToolRequest) map[string]any {
