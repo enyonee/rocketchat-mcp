@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 const defaultCount = 50
 
 var (
+	baseURL    string
 	apiBase    string
 	authToken  string
 	authUserID string
@@ -43,7 +45,8 @@ func main() {
 			log.Fatalf("%s is required", v)
 		}
 	}
-	apiBase = strings.TrimRight(os.Getenv("ROCKETCHAT_URL"), "/") + "/api/v1"
+	baseURL = strings.TrimRight(os.Getenv("ROCKETCHAT_URL"), "/")
+	apiBase = baseURL + "/api/v1"
 	authToken = os.Getenv("ROCKETCHAT_AUTH_TOKEN")
 	authUserID = os.Getenv("ROCKETCHAT_USER_ID")
 	readOnly = strings.EqualFold(os.Getenv("READ_ONLY"), "true")
@@ -128,6 +131,40 @@ func rcGet(endpoint string, params url.Values) (map[string]any, error) {
 
 func rcPost(endpoint string, body any) (map[string]any, error) {
 	return rcRequest("POST", endpoint, body)
+}
+
+const maxDownloadSize = 25 * 1024 * 1024 // 25 MB
+
+func rcDownload(fileURL string) ([]byte, string, error) {
+	if strings.HasPrefix(fileURL, "/") {
+		fileURL = baseURL + fileURL
+	}
+	req, err := http.NewRequest("GET", fileURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("X-Auth-Token", authToken)
+	req.Header.Set("X-User-Id", authUserID)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("HTTP %d downloading file", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if i := strings.Index(ct, ";"); i > 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadSize+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > maxDownloadSize {
+		return nil, "", fmt.Errorf("file exceeds 25 MB limit")
+	}
+	return data, ct, nil
 }
 
 func resolveRoomID(channel string) (string, error) {
@@ -579,5 +616,30 @@ func registerTools(s *server.MCPServer) {
 			return fail(err.Error())
 		}
 		return res(map[string]any{"channel": ch, "total": num(data, "total"), "files": fmtAll(getSlice(data, "files"), fmtFile)})
+	})
+
+	s.AddTool(mcp.NewTool("download_file",
+		mcp.WithDescription("Скачать файл (картинку, документ, аттач) по URL из Rocket.Chat. URL берётся из list_room_files или attachments в сообщениях."),
+		mcp.WithString("url", mcp.Required(), mcp.Description("URL файла (относительный /file-upload/... или полный)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		fileURL := sarg(req, "url")
+		if fileURL == "" {
+			return fail("url is required")
+		}
+		data, mimeType, err := rcDownload(fileURL)
+		if err != nil {
+			return fail(err.Error())
+		}
+		encoded := base64.StdEncoding.EncodeToString(data)
+		if strings.HasPrefix(mimeType, "image/") {
+			return mcp.NewToolResultImage(fmt.Sprintf("Image (%s, %d bytes)", mimeType, len(data)), encoded, mimeType), nil
+		}
+		if strings.HasPrefix(mimeType, "text/") {
+			return mcp.NewToolResultText(string(data)), nil
+		}
+		return mcp.NewToolResultResource(
+			fmt.Sprintf("File (%s, %d bytes)", mimeType, len(data)),
+			mcp.BlobResourceContents{URI: fileURL, MIMEType: mimeType, Blob: encoded},
+		), nil
 	})
 }
